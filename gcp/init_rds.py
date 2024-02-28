@@ -1,5 +1,5 @@
 import boto3
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # AWS 계정의 인증 정보 설정
 aws_access_key_id = 
@@ -76,13 +76,13 @@ cursor.execute(truncate_query)
 init_dict=(get_keyword_store_info(aws_access_key_id, aws_secret_access_key, region_name))
 # 기본값으로 사용할 날짜 및 시간
 default_date_str = '2024-01-01 00:00:00'
-# 현재 날짜 및 시간을 문자열로 변환
-now_date_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+# '2024-01-01 00:00:00'을 유닉스 타임스탬프로 변환
+default_timestamp = int(datetime.strptime(default_date_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc).timestamp())
 for key in init_dict:
     keyword=key
     store_list=init_dict[key][0]
     for store in store_list:
-        data_to_insert = (keyword, store, now_date_str, now_date_str, now_date_str, now_date_str)
+        data_to_insert = (keyword, store, default_timestamp, default_timestamp)
         insert_query = "INSERT INTO keyword_stores (keyword, store_id, monthly_update_date, daily_update_date) VALUES (%s, %s, FROM_UNIXTIME(%s), FROM_UNIXTIME(%s))"
         cursor.execute(insert_query, data_to_insert)
     conn.commit()
