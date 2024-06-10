@@ -1,13 +1,26 @@
 from airflow import DAG
+import difflib
 from datetime import datetime, timedelta
 from airflow.models import Variable
 from airflow.operators.python_operator import PythonOperator
 import logging
 import pymysql
 from sqlalchemy import create_engine, MetaData, Table, select, text
+from utils.slack_Alert import SlackAlert
+
+# slack = SlackAlert("#practice", Variable.get("slack"))
 
 places = {
-    "강남구": ["강남역", "선릉역", "신논현역·논현역", "역삼역", "가로수길", "압구정로데오거리", "청담동 명품거리", "강남 MICE 관광특구"],
+    "강남구": [
+        "강남역",
+        "선릉역",
+        "신논현역·논현역",
+        "역삼역",
+        "가로수길",
+        "압구정로데오거리",
+        "청담동 명품거리",
+        "강남 MICE 관광특구",
+    ],
     "강동구": ["서울 암사동 유적", "고덕역", "천호역", "광나루한강공원"],
     "강북구": ["미아사거리역", "북한산우이역", "수유역", "4·19 카페거리", "수유리 먹자골목", "북서울꿈의숲"],
     "강서구": ["발산역", "서울식물원·마곡나루역", "김포공항", "강서한강공원"],
@@ -56,7 +69,7 @@ places = {
         "국립중앙박물관·용산가족공원",
         "노들섬",
         "이촌한강공원",
-        "이태원 관광특구"
+        "이태원 관광특구",
     ],
     "은평구": ["연신내역"],
     "종로구": [
@@ -73,20 +86,36 @@ places = {
         "인사동·익선동",
         "광화문광장",
         "청와대",
-        "종로·청계 관광특구"
+        "종로·청계 관광특구",
     ],
     "중구": ["덕수궁길·정동길", "DDP(동대문디자인플라자)", "남산공원", "시청광장", "명동 관광특구"],
 }
 
+exceptions = {
+    "4·19 카페거리": "419카페거리주변",
+    "DDP(동대문디자인플라자)": "DDP",
+    "DMC(디지털미디어시티)": "DMC",
+    "서울 암사동 유적": "암사동",
+    "광장(전통)시장": "광장시장",
+    "방배역 먹자골목": "방배역",
+    "수유리 먹자골목": "수유리",
+    "영등포 타임스퀘어": "영등포",
+    "이태원 앤틱가구거리": "이태원",
+    "창동 신경제 중심지": "창동",
+    "청담동 명품거리": "청담동",
+    "청량리 제기동 일대 전통시장": "청량리",
+}
 
 
 def get_RDS_engine():
-    engine = create_engine(Variable.get('mysql'))
+    engine = create_engine(Variable.get("mysql"))
     return engine
 
+
 def get_Redshift_engine():
-    engine = create_engine(Variable.get('redshift'))
+    engine = create_engine(Variable.get("redshift"))
     return engine
+
 
 def etl(schema, table, **kwargs):
     redshift_engine = get_Redshift_engine()
@@ -95,8 +124,12 @@ def etl(schema, table, **kwargs):
     rds_engine = get_RDS_engine()
     metadata_rds_con = MetaData(bind=rds_engine, schema=schema)
     metadata_rds_gu = MetaData(bind=metadata_redshift, schema=schema)
-    target_table = Table(table, metadata_rds_con, autoload_with=rds_engine, autoload=True)
-    target_table_gu = Table('population_guinfo', metadata_rds_gu, autoload_with=rds_engine, autoload=True)
+    target_table = Table(
+        table, metadata_rds_con, autoload_with=rds_engine, autoload=True
+    )
+    target_table_gu = Table(
+        "population_guinfo", metadata_rds_gu, autoload_with=rds_engine, autoload=True
+    )
     # Redshift로 직접 쿼리를 사용하여 데이터를 추출하는 코드
     query = """
         SELECT *
@@ -109,88 +142,167 @@ def etl(schema, table, **kwargs):
     """
     redshift_data = redshift_engine.execute(query).fetchall()
     logging.info(redshift_data)
-    
+
     # RDS로 데이터 적재
     for row in redshift_data:
-        data = {
-            'conn_time': row.conn_time.strftime('%Y-%m-%d %H:%M:%S'), # datetime 객체를 문자열로 변환
-            'location': row.area_name,
-            'area_code': row.area_code,
-            'area_congest': row.area_congest,
-            'area_congest_msg': row.area_congest_msg, 
-            'area_population_min': row.area_population_min,
-            'area_population_max': row.area_population_max,
-            'male_rate': row.male_rate,
-            'female_rate': row.female_rate,
-            'fcst_yn': row.fcst_yn,
-        }
-        execution_date = kwargs.get('execution_date')
-        data['request_time'] = execution_date
+        if (
+            row.area_name != "4·19 카페거리"
+            and "·" in row.area_name
+            and "특구" not in row.area_name
+        ):
+            area_names = row.area_name.split("·")
+            area1, area2 = area_names[0], area_names[1]
+            if "역" in area1 and "역" not in area2:
+                area2 += "역"
+            elif "역" in area2 and "역" not in area1:
+                area1 += "역"
 
-        gu_name = None
-        for key, value in places.items():
-            if data['location'] in value:
-                gu_name = key
-                break
+            areas = [area1, area2]
+            for i in range(2):
+                data = {
+                    "conn_time": row.conn_time.strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    "location": areas[i],  # 신논현역·논현역
+                    "area_code": row.area_code,
+                    "area_congest": row.area_congest,
+                    "area_congest_msg": row.area_congest_msg,
+                    "area_population_min": row.area_population_min,
+                    "area_population_max": row.area_population_max,
+                    "male_rate": row.male_rate,
+                    "female_rate": row.female_rate,
+                    "fcst_yn": row.fcst_yn,
+                }
+                execution_date = kwargs.get("execution_date")
+                data["request_time"] = execution_date
+                data["api_location"] = row.area_name
 
-        if gu_name == None:
-            logging.warning("서울대공원은 처리되지 않습니다.")
-            continue
-        
-        if gu_name is not None:
-            # 다른 테이블에서 해당하는 구의 ID 가져오기
-            # query = text("SELECT id FROM population_guinfo WHERE gu = :gu_name")
-            # gu_id = rds_engine.execute(query, {'gu_name': gu_name}).fetchone()
-            stmt2 = select([target_table_gu.c.id]).where(target_table_gu.c.gu == gu_name)
-            gu_id = rds_engine.execute(stmt2).fetchone()
-            print(gu_id)
-            if gu_id:    
-                data['gu_id'] = gu_id[0]
-            else:
-                logging.warning(f"No ID found for gu_name: {gu_name}")
+                gu_name = None
+                for key, value in places.items():
+                    if data["api_location"] in value:
+                        gu_name = key
+                        break
 
-        stmt = select([target_table]).where(target_table.c.location == data['location'])
-        result = rds_engine.execute(stmt)
+                if gu_name == None:
+                    logging.warning("서울대공원은 처리되지 않습니다.")
+                    continue
 
-        # 레코드가 존재하는 경우 업데이트
-        if result.fetchone() is not None:
-            stmt = (
-                target_table.update().
-                where(target_table.c.location == data['location']).
-                values(data)
-            )
-        # 레코드가 존재하지 않는 경우 삽입
+                if gu_name is not None:
+                    stmt2 = select([target_table_gu.c.id]).where(
+                        target_table_gu.c.gu == gu_name
+                    )
+                    gu_id = rds_engine.execute(stmt2).fetchone()
+                    print(gu_id)
+                    if gu_id:
+                        data["gu_id"] = gu_id[0]
+                    else:
+                        logging.warning(f"No ID found for gu_name: {gu_name}")
+
+                stmt = select([target_table]).where(
+                    target_table.c.location == data["location"]
+                )
+                result = rds_engine.execute(stmt)
+
+                if result.fetchone() is not None:
+                    stmt = (
+                        target_table.update()
+                        .where(target_table.c.location == data["location"])
+                        .values(data)
+                    )
+                else:
+                    stmt = target_table.insert().values(data)
+
+                rds_engine.execute(stmt)
+
+            logging.info("Load done")
+
         else:
-            stmt = target_table.insert().values(data)
+            if row.area_name in exceptions:
+                area_name = exceptions[row.area_name]
+            else:
+                area_name = row.area_name
 
-        rds_engine.execute(stmt)
+            data = {
+                "conn_time": row.conn_time.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),  
+                "location": area_name,
+                "area_code": row.area_code,
+                "area_congest": row.area_congest,
+                "area_congest_msg": row.area_congest_msg,
+                "area_population_min": row.area_population_min,
+                "area_population_max": row.area_population_max,
+                "male_rate": row.male_rate,
+                "female_rate": row.female_rate,
+                "fcst_yn": row.fcst_yn,
+            }
+            execution_date = kwargs.get("execution_date")
+            data["request_time"] = execution_date
+            data["api_location"] = row.area_name
 
-    logging.info("Load done")
+            gu_name = None
+            for key, value in places.items():
+                if data["api_location"] in value:
+                    gu_name = key
+                    break
+
+            if gu_name == None:
+                logging.warning("서울대공원은 처리되지 않습니다.")
+                continue
+
+            if gu_name is not None:
+                stmt2 = select([target_table_gu.c.id]).where(
+                    target_table_gu.c.gu == gu_name
+                )
+                gu_id = rds_engine.execute(stmt2).fetchone()
+                print(gu_id)
+                if gu_id:
+                    data["gu_id"] = gu_id[0]
+                else:
+                    logging.warning(f"No ID found for gu_name: {gu_name}")
+
+            stmt = select([target_table]).where(
+                target_table.c.location == data["location"]
+            )
+            result = rds_engine.execute(stmt)
+
+            if result.fetchone() is not None:
+                stmt = (
+                    target_table.update()
+                    .where(target_table.c.location == data["location"])
+                    .values(data)
+                )
+            else:
+                stmt = target_table.insert().values(data)
+
+            rds_engine.execute(stmt)
+
+        logging.info("Load done")
 
 
 default_args = {
-    'owner': 'airflow',
-    'depends_on_past': False,
-    'retries': 5,
-    'retry_delay': timedelta(minutes=1),
-    'start_date': datetime(2024, 3, 2),
-    'schedule_interval': timedelta(minutes=10),
+    "owner": "airflow",
+    "depends_on_past": False,
+    "retries": 5,
+    "retry_delay": timedelta(minutes=1),
+    "start_date": datetime(2024, 3, 2),
+    "schedule_interval": timedelta(minutes=10),
 }
 
 dag = DAG(
-    'refresh_tourism_data',
+    "refresh_tourism_data",
     default_args=default_args,
-    description='A DAG to full refresh congestion data in RDS',
-    schedule='5,15,25,35,45,55 * * * *',
-    catchup=False
+    description="A DAG to full refresh congestion data in RDS",
+    schedule="5,15,25,35,45,55 * * * *",
+    catchup=False,
 )
 
 etl_task = PythonOperator(
-    task_id='etl_task',
+    task_id="etl_task",
     python_callable=etl,
-    op_kwargs={'schema': 'de41mysql', 'table': 'population_congestioninfo'},
+    op_kwargs={"schema": "de41mysql", "table": "population_congestioninfo"},
     provide_context=True,
-    dag=dag
+    dag=dag,
 )
 
 etl_task
